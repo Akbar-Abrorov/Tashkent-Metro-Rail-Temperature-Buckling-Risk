@@ -1,0 +1,8 @@
+meteostat==2.1.4
+pvlib==0.15.2
+pandas==3.0.5
+numpy==2.5.3
+scikit-learn==1.9.0
+xgboost==3.4.1
+torch==2.14.0
+matplotlib==3.11.1
