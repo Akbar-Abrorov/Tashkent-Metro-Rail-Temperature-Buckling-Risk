@@ -25,6 +25,10 @@ radiative loss:
 
     alpha * GHI = h_c * (T_rail - T_air) + eps * sigma * (T_rail^4 - T_sky^4)
 
+  GHI here is CLOUD-ADJUSTED GHI (see src/cloud_adjustment.py), not raw
+  clear-sky GHI -- real observed cloud cover now reduces absorbed solar
+  energy on cloudy hours.
+
   alpha    solar absorptivity of the rail surface (weathered steel: ~0.80)
   eps      longwave emissivity of the rail surface (~0.85)
   sigma    Stefan-Boltzmann constant
@@ -41,6 +45,8 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+
+from cloud_adjustment import add_cloud_adjusted_irradiance
 
 SIGMA = 5.670374419e-8  # Stefan-Boltzmann constant, W/m^2/K^4
 
@@ -103,13 +109,18 @@ def add_physical_baseline(df: pd.DataFrame) -> pd.DataFrame:
     outputs/physical_model_agreement.csv. It is NOT the ML training target;
     that is rail_temp_cnu_c (see src/train_models.py PROXY_TARGET_COLUMN).
 
-    Expects columns: air_temp_c, clearsky_ghi_wm2, wind_speed_ms
-    (produced by src/fetch_weather.py).
+    Uses CLOUD-ADJUSTED GHI (src/cloud_adjustment.py, Kasten & Czeplak 1980),
+    not raw clear-sky GHI -- real observed cloud_cover_okta now reduces
+    absorbed solar energy on cloudy hours. See cloud_adjustment.py's
+    docstring for the formula and its stated approximation.
+
+    Expects columns: air_temp_c, clearsky_ghi_wm2, cloud_cover_okta,
+    wind_speed_ms (produced by src/fetch_weather.py).
     """
-    out = df.copy()
+    out = add_cloud_adjusted_irradiance(df)
     out["rail_temp_steadystate_c"] = predict_rail_temperature(
         air_temp_c=out["air_temp_c"],
-        ghi_wm2=out["clearsky_ghi_wm2"],
+        ghi_wm2=out["cloudy_ghi_wm2"],
         wind_speed_ms=out["wind_speed_ms"],
     )
     return out

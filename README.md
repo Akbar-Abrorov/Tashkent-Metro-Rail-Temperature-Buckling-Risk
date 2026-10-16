@@ -2,7 +2,8 @@
 
 Predicting rail surface temperature for the Tashkent Metro (Uzbekistan) from
 weather + solar position features: a real published physical model, a
-secondary hand-rolled physical model used to cross-check it, RF/ANN models
+secondary hand-rolled physical model used to cross-check it, both driven by
+cloud-cover-adjusted (not just clear-sky) solar irradiance, RF/ANN models
 trained to reproduce the physical model's output from weather alone, and a
 set of research-style diagnostics (naive-baseline comparison, cross-
 validation, sensitivity analysis) meant to make this defensible as more than
@@ -34,7 +35,7 @@ below for how much the unavoidable azimuth guess actually matters.
 | Component | Status |
 |---|---|
 | Weather data (`data/raw/tashkent_weather_*.csv`) | **REAL.** Observed hourly data from Meteostat station 38457 (WMO 38457 / ICAO UTTT / IATA TAS, "Tashkent", 41.2667N 69.2667E, 489 m elevation), June 2023 – Jan 2026. This is the only Meteostat station within 50 km of Tashkent (next nearest is ~71 km away), so it is queried directly — no multi-station interpolation. See `outputs/weather_audit.md` for a full data-quality audit. |
-| Solar position + clear-sky irradiance | **REAL, but computed, not measured.** pvlib's SPA solar-position algorithm and the Ineichen clear-sky model, deterministic functions of timestamp + station location. Not a statistical/fitted placeholder, but also not a pyranometer measurement — actual cloud cover will reduce real irradiance below the "clear-sky" value on cloudy hours. Both physical baselines (Model A and B) use **clear-sky**, not cloud-adjusted, irradiance — see "Known limitations." |
+| Solar position + irradiance | **REAL, but computed, not measured, now cloud-adjusted.** pvlib's SPA solar-position algorithm and Ineichen clear-sky model give the clear-sky baseline; `src/cloud_adjustment.py` then reduces it using real observed `cloud_cover_okta` (Kasten & Czeplak 1980 formula) before either physical model uses it — see "Cloud-cover adjustment" below. Still not a pyranometer measurement, and the cloud-reduction formula is itself an approximation (see that section). |
 | **Model A — RailTemp/CNU** (`rail_temp_cnu_c`) | **A real, published, third-party model** — [github.com/aryvini/railtemp](https://github.com/aryvini/railtemp), GPL-3.0, a transient (thermal-mass) rail heat-balance model built on Hong et al. (2019, *IJPEM-GT*, DOI 10.1007/s12541-019-00015-1), the same paper this project already cited. Run via a separate script/venv (see below) because the package requires Python <3.14. This is the model RF/ANN are actually trained against. It still rests on several documented assumptions about geometry/orientation (see "Physical models" below and the scope note above) — it is a real model run with assumed, not measured, local parameters. |
 | **Model B — steady-state baseline** (`rail_temp_steadystate_c`) | A simpler, hand-rolled, fast steady-state heat-balance model (`src/physical_model.py`), **not** a reproduction of any specific paper's exact formula. Used only to cross-check Model A (see `outputs/physical_model_agreement.csv`) — it is not the ML training target. |
 | Random Forest & ANN predictions | **Trained on Model A's (RailTemp/CNU) own output as a proxy target**, because no real measured rail temperature exists yet (see below). Their RMSE/MAE/R² measure only how well each model reproduces Model A's output from weather features on a **held-out chronological test split** — not real-world prediction accuracy. See "Evaluation methodology" below. |
@@ -67,11 +68,12 @@ and serve different roles:
     corridor — see the scope note above (the only physically-relevant line
     is a ring). 90° is used as an arbitrary representative midpoint; see
     "Model A sensitivity analysis" below for how much this choice matters.
-  - **Solar input is `clearsky_dni_wm2` (direct normal irradiance), not
+  - **Solar input is cloud-adjusted DNI (direct normal irradiance), not
     GHI** — the model's sun-exposed area is already the beam-projected
     area, so using GHI would double-count the elevation-angle geometry.
     This is an easy mistake to make silently; it's called out here on
-    purpose.
+    purpose. "Cloud-adjusted" means clear-sky DNI reduced by real observed
+    cloud cover — see "Cloud-cover adjustment" below.
   - Regenerate it (after `python3 src/fetch_weather.py`):
     ```bash
     python3.13 -m venv .venv-railtemp
@@ -83,15 +85,50 @@ and serve different roles:
 - **Model B — steady-state baseline** (`src/physical_model.py`). A generic
   solar-absorption-vs-convective/radiative-cooling steady-state model, no
   thermal mass/lag. Computed by `src/pipeline.py` directly (fast, vectorized,
-  no extra venv needed). Used only as a cross-check against Model A over
-  their full overlap — see `outputs/physical_model_agreement.csv` /
-  `outputs/plots/physical_model_agreement.png`. Current agreement on the full
-  2023-06-01–2026-01-01 range: RMSE≈9.5°C, bias≈+1.4°C (B runs hotter than
-  A), R²≈0.40 — the two models broadly track each other but disagree
-  substantially in magnitude, consistent with B's missing thermal mass/lag
-  and B's different (simpler) convection/radiation treatment. This is
-  reported, not hidden, as evidence of how much the fast surrogate diverges
-  from the real published model.
+  no extra venv needed), also driven by cloud-adjusted (not clear-sky) GHI.
+  Used only as a cross-check against Model A over their full overlap — see
+  `outputs/physical_model_agreement.csv` / `outputs/plots/physical_model_agreement.png`.
+  Current agreement on the full 2023-06-01–2026-01-01 range: RMSE≈8.7°C,
+  bias≈+0.7°C (B runs slightly hotter than A), R²≈0.50 — the two models
+  broadly track each other but disagree substantially in magnitude,
+  consistent with B's missing thermal mass/lag and B's different (simpler)
+  convection/radiation treatment. (Before the cloud-cover fix below, this
+  was RMSE≈9.5°C/R²≈0.40 — adding real cloud data to both models improved
+  their agreement, since it removed a shared blind spot that had been
+  pushing both toward clear-sky-only overestimates on cloudy days, though
+  not by equal amounts.) This is reported, not hidden, as evidence of how
+  much the fast surrogate diverges from the real published model.
+
+## Cloud-cover adjustment
+
+Both physical models originally used pvlib's **clear-sky** irradiance only
+— real observed cloud cover (`cloud_cover_okta`, a genuine Meteostat field)
+was sitting in the dataset unused for this purpose. `src/cloud_adjustment.py`
+fixes this using the **Kasten & Czeplak (1980)** empirical clearness-index
+formula (*Solar Energy* 24(2):177-189), a standard result from the solar-
+resource literature:
+
+```
+Kc(N) = 1 - 0.75 * (N / 8)^3.4        N = cloud cover in oktas, 0-8
+```
+
+Kc=1 at N=0 (no reduction), Kc=0.25 at N=8 (irradiance cut to 25% of
+clear-sky). Model B multiplies `clearsky_ghi_wm2` by Kc; Model A's separate
+venv reproduces the same formula (can't import across venvs) and multiplies
+`clearsky_dni_wm2` by it before the simulation.
+
+**Stated approximation, not hidden:** Kasten & Czeplak was derived for GHI.
+There's no equally standard okta-based formula for DNI specifically (real
+clouds attenuate direct beam more selectively than global/diffuse
+radiation). Both models apply the *same* Kc factor to whichever irradiance
+component they use — a simplification, not a validated cloud-opacity
+partitioning model. In reality this likely still somewhat *overestimates*
+DNI under partial cloud. See `src/cloud_adjustment.py`'s docstring.
+
+**Measured effect:** on the full dataset, this pulled Model A's mean rail
+temperature down from 21.51°C to 20.79°C, and visibly changed RF's feature
+importance — `cloud_cover_okta` went from ~0.07% (functionally zero,
+confirming it was being ignored) to ~0.94% — see "Diagnostics" below.
 
 ## Model A sensitivity analysis
 
@@ -104,8 +141,8 @@ renders `outputs/plots/model_a_sensitivity.png` from the resulting
 
 | parameter | sweep range | mean abs. deviation | max abs. deviation |
 |---|---|---|---|
-| track azimuth | 0°–180° | up to 1.23°C | up to 6.01°C |
-| ambient emissivity | 0.3–0.9 | up to 0.28°C | up to 1.43°C |
+| track azimuth | 0°–180° | up to 1.16°C | up to 6.01°C |
+| ambient emissivity | 0.3–0.9 | up to 0.26°C | up to 1.22°C |
 
 **Azimuth is the dominant source of uncertainty in Model A** — roughly 4x
 the effect of ambient emissivity over its plausible range, and consistent
@@ -123,10 +160,10 @@ something trivial? `src/baselines.py` scores two naive baselines on the
 
 | model | RMSE (°C) | MAE (°C) | R² |
 |---|---|---|---|
-| persistence (target[t] = target[t-1]) | 2.35 | 1.78 | 0.961 |
-| linear (rail_temp = a·air_temp + b) | 3.73 | 3.11 | 0.901 |
-| random_forest | 0.97 | 0.67 | 0.993 |
-| ann | 1.11 | 0.82 | 0.991 |
+| persistence (target[t] = target[t-1]) | 2.19 | 1.65 | 0.967 |
+| linear (rail_temp = a·air_temp + b) | 3.17 | 2.46 | 0.930 |
+| random_forest | 0.90 | 0.63 | 0.994 |
+| ann | 1.12 | 0.87 | 0.991 |
 
 Both RF and ANN meaningfully beat both naive baselines, and the gap holds
 up across all 5 cross-validation folds below (not just this one split) —
@@ -145,10 +182,10 @@ reports mean ± std across folds, written to `outputs/cv_metrics.csv` /
 
 | model | RMSE mean ± std (°C) | R² mean ± std |
 |---|---|---|
-| persistence | 2.40 ± 0.28 | 0.933 ± 0.011 |
-| linear_airtemp | 3.89 ± 0.95 | 0.828 ± 0.042 |
-| random_forest | 1.15 ± 0.42 | 0.985 ± 0.007 |
-| ann | 1.34 ± 0.30 | 0.980 ± 0.004 |
+| persistence | 2.22 ± 0.16 | 0.939 ± 0.014 |
+| linear_airtemp | 3.25 ± 0.68 | 0.873 ± 0.034 |
+| random_forest | 1.09 ± 0.36 | 0.986 ± 0.007 |
+| ann | 1.23 ± 0.21 | 0.981 ± 0.005 |
 
 RF/ANN beat both naive baselines in every one of the 5 folds (different
 seasons, different amounts of training history) — the single-split result
@@ -161,41 +198,43 @@ always on the test split only):
 
 - **Feature importance** (`outputs/feature_importance.csv`,
   `outputs/plots/feature_importance.png`): `air_temp_c` dominates RF's
-  splits (~88%), followed by `clearsky_dni_wm2`/`clearsky_ghi_wm2` (~9%
-  combined); `cloud_cover_okta` is ~0%. That near-zero cloud importance is
-  **not evidence clouds don't matter physically** — it's because Model A's
-  own input is clear-sky irradiance (see "Known limitations"), so an RF
-  trained to imitate Model A correctly learns that cloud cover, which Model
-  A itself ignores, doesn't predict its output.
+  splits (~93%), followed by `clearsky_dni_wm2` (~4%); `cloud_cover_okta`
+  now sits at **~0.94%** — up roughly 10x from ~0.07% before the cloud-cover
+  fix above, and now ranked above `clearsky_ghi_wm2`. That's a direct,
+  measurable confirmation the fix is doing real work: cloud cover is now
+  something the model can actually learn from, because it's now something
+  Model A's own output actually depends on.
 - **Parity and residual plots** (`outputs/plots/parity_plots.png`,
-  `outputs/plots/residuals.png`): both models track the target closely with
-  roughly symmetric, near-unbiased residuals (RF residual mean 0.04°C,
-  ANN -0.28°C) across most of the range.
+  `outputs/plots/residuals.png`): both models track the target closely
+  overall. RF stays close to unbiased (residual mean +0.03°C); the ANN now
+  shows a somewhat larger systematic under-prediction (residual mean
+  -0.39°C, vs. -0.28°C before the cloud fix) — cloud cover added a feature
+  the ANN has to use correctly, and it isn't fully doing so.
 - **Error by temperature regime** (`outputs/test_metrics_by_regime.csv`) —
   overall average error is a weak summary for a buckling-*risk* application;
   what matters is accuracy in the hot tail specifically:
 
   | regime | model | n | RMSE (°C) | R² |
   |---|---|---|---|---|
-  | overall | random_forest | 4536 | 0.97 | 0.993 |
-  | overall | ann | 4536 | 1.11 | 0.991 |
-  | hottest decile (≥39.1°C) | random_forest | 454 | 0.78 | 0.886 |
-  | hottest decile (≥39.1°C) | ann | 454 | 1.26 | 0.706 |
-  | ≥40°C | random_forest | 370 | 0.78 | 0.868 |
-  | ≥40°C | ann | 370 | 1.25 | 0.662 |
+  | overall | random_forest | 4536 | 0.90 | 0.994 |
+  | overall | ann | 4536 | 1.12 | 0.991 |
+  | hottest decile (≥39.0°C) | random_forest | 454 | 0.84 | 0.874 |
+  | hottest decile (≥39.0°C) | ann | 454 | 1.72 | 0.475 |
+  | ≥40°C | random_forest | 356 | 0.80 | 0.865 |
+  | ≥40°C | ann | 356 | 1.74 | 0.362 |
 
-  **Both models degrade substantially in the hot tail** — RF's R² drops from
-  0.993 overall to 0.868 above 40°C, and the ANN's drops further, from 0.991
-  to 0.662. This is a real, honest finding, not an error: ML models trained
-  on mostly-moderate weather data generalize worse at the sparse, extreme
-  end of the distribution, which is exactly the regime a buckling-risk
-  application cares about most. (An earlier run of this table, on a smaller
-  15%-test-split test window with only 101 rows ≥40°C, showed the ANN's R²
-  going outright negative in that regime — a real result for that window,
-  but also a reminder that a small test subset can be noisy; the 20%-split
-  test window here has 370 rows ≥40°C and gives a more stable estimate.
-  Either way: don't quote the overall R²≈0.99 as if it describes performance
-  where it matters.)
+  **Both models degrade substantially in the hot tail, and the gap got
+  WORSE for the ANN after adding cloud cover** — its R² in the ≥40°C regime
+  dropped from 0.66 (pre-cloud-fix) to 0.36. RF held up better (0.87, both
+  before and after). The likely reason: cloud cover is a genuinely harder
+  signal to use correctly than temperature/irradiance, and the hot tail is
+  already the most data-sparse region — adding a harder-to-learn feature
+  hurt the ANN specifically there more than it helped. This is a real,
+  honest finding, not a bug: it's a reminder that a "more complete" physical
+  input (real clouds instead of clear-sky) doesn't automatically make the ML
+  model that imitates it more accurate everywhere, especially in the sparse
+  tail that matters most for buckling risk. Don't quote the overall
+  R²≈0.99 as if it describes performance where it matters.
 
 ## Evaluation methodology (ANN leakage fix)
 
@@ -245,6 +284,7 @@ src/
   fetch_weather.py       Pulls real hourly Meteostat data for station 38457,
                           adds pvlib solar position + clear-sky irradiance.
   audit_weather.py       Data-quality audit -> outputs/weather_audit.md.
+  cloud_adjustment.py    Kasten & Czeplak cloud-cover irradiance reduction.
   physical_model.py      Model B: steady-state heat-balance baseline.
   train_models.py        RF + ANN, chronological train/val/test split, model caching.
   baselines.py            Naive persistence/linear baselines, same test split.
@@ -330,19 +370,27 @@ Outputs land in `outputs/` (see "Project layout" above for the full list).
   emissivity) are documented assumptions, not measured — see "Physical
   models" and "Model A sensitivity analysis" (azimuth in particular can
   shift Model A's output by up to ~6°C at the extremes tested).
-- Both Model A and Model B use **clear-sky**, not cloud-adjusted, solar
-  irradiance — real cloud cover (which the weather data does include,
-  `cloud_cover_okta`) isn't applied to reduce irradiance on cloudy hours.
-  This is directly visible in the RF feature-importance result (cloud cover
-  ≈0% importance) — see "Diagnostics" above.
+- Cloud cover is now applied (see "Cloud-cover adjustment" above), but via
+  the same Kasten & Czeplak factor on GHI, DNI and DHI alike — a stated
+  approximation, not a validated cloud-opacity partitioning model (real
+  clouds attenuate direct beam more selectively). Likely still somewhat
+  overestimates DNI under partial cloud.
+- Explicit solar-angle features (`solar_zenith_deg`/`solar_elevation_deg`)
+  contribute almost nothing to RF's predictions (~0.3% combined importance)
+  because irradiance already encodes most of that information — expected,
+  not a sign the physics is wrong. Separately, Model A computes its own
+  solar position internally (via `pysolar`), independent of the
+  `pvlib`-computed columns used elsewhere in this project; nothing currently
+  cross-checks that the two agree.
 - Model B (the secondary baseline) has no thermal mass/lag — predicted rail
   temperature responds instantly to weather changes, which real rail does
   not. Part of why Model A and Model B disagree; Model B is not used as the
   ML target specifically because of this.
 - **RF/ANN accuracy degrades substantially in the hot tail** (ANN R² drops
-  to 0.66 above 40°C, RF's to 0.87, vs. ~0.99 overall) — see "Diagnostics"
-  above. Don't use the overall R²≈0.99 to characterize performance in the
-  regime that actually matters for buckling risk.
+  to 0.36 above 40°C — worse than before the cloud-cover fix (0.66), RF
+  holds up better at 0.87 — vs. ~0.99 overall) — see "Diagnostics" above.
+  Don't use the overall R²≈0.99 to characterize performance in the regime
+  that actually matters for buckling risk.
 - The weather dataset itself is high quality (0 timestamp gaps/duplicates
   over the full 2.5-year range, only `precip_mm` has missing values at 2%) —
   see `outputs/weather_audit.md` — but it is still a single station, so it

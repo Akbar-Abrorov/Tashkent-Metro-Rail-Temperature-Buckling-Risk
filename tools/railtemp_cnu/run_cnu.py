@@ -61,6 +61,15 @@ MODELING CHOICES (all documented, none hidden):
   beam-projected area (profile shadow x sin(solar elevation)), so multiplying
   it by GHI would double-count the elevation-angle geometry. This is an easy
   mistake to make silently; call it out explicitly.
+- `clearsky_dni_wm2` is further reduced by REAL OBSERVED CLOUD COVER
+  (`cloud_cover_okta`) before use, via the Kasten & Czeplak (1980)
+  clearness-index formula Kc(N) = 1 - 0.75*(N/8)^3.4 (same formula/source as
+  src/cloud_adjustment.py, reproduced here since this script runs in a
+  separate venv and can't import from src/). That formula was derived for
+  GHI, not DNI specifically -- applying it to DNI directly is a stated
+  approximation (real clouds attenuate direct beam more selectively than
+  this implies), not a validated cloud-opacity partitioning model. See
+  README.md "Known limitations."
 """
 
 from __future__ import annotations
@@ -88,6 +97,14 @@ TRACK_AZIMUTH_DEG = 90.0  # assumption: east-west orientation, unknown for this 
 AMBIENT_EMISSIVITY = 0.5  # assumption: same value used in the package's own worked example
 SOLAR_ABSORPTIVITY = 0.8  # matches src/physical_model.py DEFAULT_ABSORPTIVITY
 RAIL_EMISSIVITY = 0.7  # matches the railtemp package's own example material
+
+
+def kasten_czeplak_transmittance(cloud_okta: pd.Series) -> pd.Series:
+    """Kc(N) = 1 - 0.75 * (N/8)^3.4 (Kasten & Czeplak 1980). Reproduced here
+    (identical to src/cloud_adjustment.py) since this script runs in the
+    separate railtemp venv and can't import from src/."""
+    n = cloud_okta.clip(0.0, 8.0)
+    return 1.0 - 0.75 * (n / 8.0) ** 3.4
 
 
 def polygon_area_and_perimeter(x: np.ndarray, z: np.ndarray) -> tuple[float, float]:
@@ -120,6 +137,9 @@ def load_weather(raw_weather_csv: Path) -> pd.DataFrame:
     # __fetch_solar_data() calls tz_localize(tz) itself and errors on an
     # already-tz-aware index, so hand it naive local timestamps instead.
     df.index = df.index.tz_localize(None)
+    # Real observed cloud cover now reduces the clear-sky DNI fed into the
+    # simulation -- see kasten_czeplak_transmittance()'s docstring above.
+    df["cloudy_dni_wm2"] = df["clearsky_dni_wm2"] * kasten_czeplak_transmittance(df["cloud_cover_okta"])
     return df
 
 
@@ -155,7 +175,7 @@ def simulate(
     )
 
     weather = WeatherData(
-        solar_radiation=df["clearsky_dni_wm2"].rename("SR"),
+        solar_radiation=df["cloudy_dni_wm2"].rename("SR"),
         ambient_temperature=df["air_temp_c"].rename("Tamb"),
         wind_velocity=df["wind_speed_ms"].rename("Wv"),
         timezone=pytz.timezone(STATION_TZ),
