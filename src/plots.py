@@ -9,13 +9,14 @@ import pandas as pd
 
 
 def plot_weather_overview(df: pd.DataFrame, out_path: Path) -> None:
-    """Plot real observed Tashkent summer 2023 air temperature + clear-sky GHI."""
+    """Plot real observed Tashkent air temperature + clear-sky GHI."""
     fig, axes = plt.subplots(2, 1, figsize=(14, 7), sharex=True)
 
+    date_range = f"{df.index.min():%Y-%m-%d} to {df.index.max():%Y-%m-%d}"
     axes[0].plot(df.index, df["air_temp_c"], color="#c0392b", linewidth=0.8)
     axes[0].set_ylabel("Air temperature (deg C)")
     axes[0].set_title(
-        "Tashkent, summer 2023 -- REAL observed weather (Meteostat station 38457)"
+        f"Tashkent, {date_range} -- REAL observed weather (Meteostat station 38457)"
     )
     axes[0].grid(alpha=0.3)
 
@@ -51,6 +52,36 @@ def plot_model_comparison(predictions: pd.DataFrame, target_column: str, label: 
         "NOT validated against real measured rail temperature (see README)"
     )
     axes[1].set_title(f"Zoomed: first {zoom_days} days" if zoom_days else "")
+    axes[1].set_xlabel("Local time (Asia/Tashkent)")
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
+def plot_physical_model_agreement(df: pd.DataFrame, cnu_column: str, steadystate_column: str,
+                                   out_path: Path, zoom_days: int = 10) -> None:
+    """Compare Model A (RailTemp/CNU, transient) against Model B (steady-state)
+    on the window where both exist. Shows the steady-state model's missing
+    thermal lag relative to the published CNU model.
+    """
+    sub = df.dropna(subset=[cnu_column, steadystate_column])
+    fig, axes = plt.subplots(2, 1, figsize=(14, 9))
+
+    for ax, window in zip(axes, [sub, sub.iloc[: zoom_days * 24]]):
+        ax.plot(window.index, window[cnu_column], label="Model A: RailTemp/CNU (transient)",
+                color="black", linewidth=1.2)
+        ax.plot(window.index, window[steadystate_column], label="Model B: steady-state",
+                color="#8e44ad", linewidth=0.9, alpha=0.85)
+        ax.set_ylabel("Rail surface temp (deg C)")
+        ax.grid(alpha=0.3)
+        ax.legend(loc="upper right", fontsize=8)
+
+    axes[0].set_title(
+        "Physical model agreement: RailTemp/CNU vs. steady-state baseline\n"
+        "Both are proxy models -- neither is real measured rail temperature (see README)"
+    )
+    axes[1].set_title(f"Zoomed: first {zoom_days} days of overlap")
     axes[1].set_xlabel("Local time (Asia/Tashkent)")
 
     fig.tight_layout()

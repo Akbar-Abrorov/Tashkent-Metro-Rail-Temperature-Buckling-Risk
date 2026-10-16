@@ -1,0 +1,6 @@
+.venv/
+.venv-railtemp/
+__pycache__/
+*.pyc
+outputs/models/*.joblib
+outputs/models/*.pt

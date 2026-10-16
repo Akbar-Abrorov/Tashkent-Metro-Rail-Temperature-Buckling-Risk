@@ -1,18 +1,23 @@
 """
-Random Forest + small PyTorch ANN for rail surface temperature prediction.
+Random Forest + PyTorch ANN for rail surface temperature prediction.
 
 ======================================================================
 NO REAL GROUND-TRUTH RAIL TEMPERATURE DATA EXISTS FOR THIS PROJECT YET.
 ======================================================================
 Obtaining that requires contacting Uzbek Railways / Tashkent Metro
-directly -- a separate, unresolved step (see README.md).
+directly -- a separate, unresolved step (see README.md and
+docs/measurement_feasibility.md).
 
-Because of that, this module trains RF and the ANN on the PHYSICAL
-BASELINE MODEL'S OWN OUTPUT (src/physical_model.py) as a proxy target.
-That means: the RF/ANN metrics below measure only how well each model can
-reproduce the physical baseline's formula from weather features -- they
-say NOTHING about real-world rail temperature prediction accuracy. Do
+Because of that, this module trains RF and the ANN on the real
+RailTemp/CNU transient model's OWN OUTPUT (rail_temp_cnu_c, produced by
+tools/railtemp_cnu/run_cnu.py, cached in data/processed/) as a proxy
+target. That means: the RF/ANN metrics below measure only how well each
+model can reproduce that physical model's output from weather features --
+they say NOTHING about real-world rail temperature prediction accuracy. Do
 not quote these RMSE/MAE/R2 numbers as real-world performance anywhere.
+They are also reported ONLY on a held-out chronological test split that
+neither training nor ANN early-stopping ever saw -- see
+chronological_split_3way() and README's "Evaluation methodology" section.
 
 Once real measured rail temperature is available, call
 `train_and_evaluate_real_target()` -- the single function in this file
@@ -23,10 +28,13 @@ shared and does not need to change.
 
 from __future__ import annotations
 
+import json
 import warnings
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import cast
 
+import joblib
 import numpy as np
 import pandas as pd
 import torch
@@ -48,9 +56,15 @@ FEATURE_COLUMNS = [
     "clearsky_dhi_wm2",
 ]
 
-# Proxy target: the physical baseline's own output (src/physical_model.py).
-# NOT real measured rail temperature.
-PROXY_TARGET_COLUMN = "rail_temp_physical_c"
+# Proxy target: the real RailTemp/CNU transient model's own output (Model A --
+# tools/railtemp_cnu/run_cnu.py, cached into data/processed/). NOT real
+# measured rail temperature. See README's "Physical models" section for
+# Model A vs Model B (the steady-state secondary baseline in physical_model.py).
+PROXY_TARGET_COLUMN = "rail_temp_cnu_c"
+
+# Secondary physical baseline (src/physical_model.py), kept only for the
+# physical-model agreement check in src/pipeline.py -- not used as an ML target.
+STEADYSTATE_BASELINE_COLUMN = "rail_temp_steadystate_c"
 
 # Real target: expected column name once real measurements are obtained
 # and merged into the feature dataframe by timestamp. Does not exist yet.
@@ -71,27 +85,46 @@ class TrainedModels:
 
 
 class RailTempANN(nn.Module):
-    """Small feed-forward network: n_features -> 32 -> 16 -> 1."""
+    """Feed-forward network: n_features -> 128 -> 64 -> 32 -> 1, with dropout
+    on the two widest layers (needed now that the net has ~10x more
+    parameters than the original 32->16 version)."""
 
     def __init__(self, n_features: int):
         super().__init__()
+        self.n_features = n_features
         self.net = nn.Sequential(
-            nn.Linear(n_features, 32),
+            nn.Linear(n_features, 128),
             nn.ReLU(),
-            nn.Linear(32, 16),
+            nn.Dropout(0.1),
+            nn.Linear(128, 64),
             nn.ReLU(),
-            nn.Linear(16, 1),
+            nn.Dropout(0.1),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x).squeeze(-1)
 
 
-def chronological_split(df: pd.DataFrame, test_frac: float = 0.2) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Time-ordered split (not random) -- appropriate for autocorrelated hourly data."""
+def chronological_split_3way(
+    df: pd.DataFrame, val_frac: float = 0.15, test_frac: float = 0.15,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Time-ordered 3-way split (not random) -- appropriate for autocorrelated
+    hourly data. Train is the earliest block, val the next block (used only
+    for ANN early stopping / model selection), test the most recent block
+    (the only split ever used to report accuracy -- see README's "Evaluation
+    methodology" section).
+    """
     df = df.sort_index()
-    n_test = int(len(df) * test_frac)
-    return df.iloc[:-n_test], df.iloc[-n_test:]
+    n = len(df)
+    n_test = int(n * test_frac)
+    n_val = int(n * val_frac)
+    train_df = df.iloc[: n - n_val - n_test]
+    val_df = df.iloc[n - n_val - n_test : n - n_test]
+    test_df = df.iloc[n - n_test :]
+    return train_df, val_df, test_df
 
 
 def evaluate(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
@@ -104,7 +137,7 @@ def evaluate(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
 
 def train_random_forest(X_train: pd.DataFrame, y_train: pd.Series) -> RandomForestRegressor:
     model = RandomForestRegressor(
-        n_estimators=300, max_depth=None, min_samples_leaf=2,
+        n_estimators=500, max_depth=None, min_samples_leaf=2,
         random_state=42, n_jobs=-1,
     )
     model.fit(X_train, y_train)
@@ -194,19 +227,26 @@ def _train_and_evaluate(
         raise ValueError(f"Missing feature columns: {missing_features}")
 
     work = df.dropna(subset=feature_columns + [target_column]).copy()
-    train_df, test_df = chronological_split(work, test_frac=0.2)
+    train_df, val_df, test_df = chronological_split_3way(work, val_frac=0.15, test_frac=0.15)
 
     X_train_df = cast(pd.DataFrame, train_df[feature_columns])
+    X_val_df = cast(pd.DataFrame, val_df[feature_columns])
     X_test_df = cast(pd.DataFrame, test_df[feature_columns])
     y_train_series = cast(pd.Series, train_df[target_column])
+    y_val_series = cast(pd.Series, val_df[target_column])
     y_test_series = cast(pd.Series, test_df[target_column])
     y_train = np.asarray(y_train_series.to_numpy(), dtype=float)
+    y_val = np.asarray(y_val_series.to_numpy(), dtype=float)
     y_test = np.asarray(y_test_series.to_numpy(), dtype=float)
 
     rf_model = train_random_forest(X_train_df, y_train_series)
+    # Early stopping uses the VALIDATION split only. Using the test split here
+    # (as a previous version of this function did) would let model selection
+    # see the test data, inflating the "held-out" metrics below -- see
+    # README's "Evaluation methodology" section.
     ann_model, ann_x_scaler, ann_y_scaler = train_ann(
         np.asarray(X_train_df.to_numpy(), dtype=float), y_train,
-        np.asarray(X_test_df.to_numpy(), dtype=float), y_test,
+        np.asarray(X_val_df.to_numpy(), dtype=float), y_val,
     )
 
     rf_pred_test = rf_model.predict(X_test_df)
@@ -214,10 +254,14 @@ def _train_and_evaluate(
         ann_model, ann_x_scaler, ann_y_scaler, np.asarray(X_test_df.to_numpy(), dtype=float)
     )
 
+    # The ONLY metrics reported as accuracy anywhere (console, test_metrics.csv,
+    # README) -- computed on the test split, which neither model's training
+    # nor model selection (ANN early stopping) ever saw.
     test_metrics = {
         "random_forest": evaluate(y_test, rf_pred_test),
         "ann": evaluate(y_test, ann_pred_test),
         "n_train": len(train_df),
+        "n_val": len(val_df),
         "n_test": len(test_df),
     }
 
@@ -228,7 +272,108 @@ def _train_and_evaluate(
     predictions["ann_pred_c"] = _predict_ann(
         ann_model, ann_x_scaler, ann_y_scaler, np.asarray(full_X_df.to_numpy(), dtype=float)
     )
-    predictions["split"] = ["train"] * len(train_df) + ["test"] * len(test_df)
+    predictions["split"] = (
+        ["train"] * len(train_df) + ["val"] * len(val_df) + ["test"] * len(test_df)
+    )
+
+    return TrainedModels(
+        label=label,
+        feature_columns=feature_columns,
+        target_column=target_column,
+        rf_model=rf_model,
+        ann_model=ann_model,
+        ann_x_scaler=ann_x_scaler,
+        ann_y_scaler=ann_y_scaler,
+        predictions=predictions,
+        test_metrics=test_metrics,
+    )
+
+
+def save_models(trained: TrainedModels, models_dir: Path) -> None:
+    """Persist RF + ANN (+ scalers) to disk so pipeline.py doesn't have to
+    retrain on every run. Writes a manifest recording the feature/target
+    columns the cache was built with, so a stale cache (e.g. after changing
+    FEATURE_COLUMNS) is detected rather than silently reused."""
+    models_dir.mkdir(parents=True, exist_ok=True)
+    joblib.dump(trained.rf_model, models_dir / "rf_model.joblib")
+    joblib.dump(trained.ann_x_scaler, models_dir / "ann_x_scaler.joblib")
+    joblib.dump(trained.ann_y_scaler, models_dir / "ann_y_scaler.joblib")
+    torch.save(
+        {"n_features": trained.ann_model.n_features, "state_dict": trained.ann_model.state_dict()},
+        models_dir / "ann_model.pt",
+    )
+    manifest = {
+        "label": trained.label,
+        "feature_columns": trained.feature_columns,
+        "target_column": trained.target_column,
+    }
+    (models_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+
+
+def load_cached_models(
+    models_dir: Path, feature_columns: list[str], target_column: str,
+) -> tuple[RandomForestRegressor, RailTempANN, StandardScaler, StandardScaler, str] | None:
+    """Load a previously saved RF+ANN pair if the cache exists AND was built
+    with the same feature/target columns requested now. Returns None (caller
+    should retrain) on any mismatch or missing file -- never guesses."""
+    manifest_path = models_dir / "manifest.json"
+    if not manifest_path.exists():
+        return None
+    manifest = json.loads(manifest_path.read_text())
+    if manifest["feature_columns"] != feature_columns or manifest["target_column"] != target_column:
+        return None
+
+    rf_model = joblib.load(models_dir / "rf_model.joblib")
+    ann_x_scaler = joblib.load(models_dir / "ann_x_scaler.joblib")
+    ann_y_scaler = joblib.load(models_dir / "ann_y_scaler.joblib")
+    checkpoint = torch.load(models_dir / "ann_model.pt", weights_only=True)
+    ann_model = RailTempANN(n_features=checkpoint["n_features"])
+    ann_model.load_state_dict(checkpoint["state_dict"])
+    ann_model.eval()
+    return rf_model, ann_model, ann_x_scaler, ann_y_scaler, manifest["label"]
+
+
+def evaluate_cached_models(
+    df: pd.DataFrame,
+    feature_columns: list[str],
+    target_column: str,
+    rf_model: RandomForestRegressor,
+    ann_model: RailTempANN,
+    ann_x_scaler: StandardScaler,
+    ann_y_scaler: StandardScaler,
+    label: str,
+) -> TrainedModels:
+    """Re-run the same chronological split used at training time purely to
+    recompute held-out test metrics and full-dataset predictions for a
+    loaded (not retrained) model pair."""
+    work = df.dropna(subset=feature_columns + [target_column]).copy()
+    train_df, val_df, test_df = chronological_split_3way(work, val_frac=0.15, test_frac=0.15)
+
+    X_test_df = cast(pd.DataFrame, test_df[feature_columns])
+    y_test = np.asarray(cast(pd.Series, test_df[target_column]).to_numpy(), dtype=float)
+
+    rf_pred_test = rf_model.predict(X_test_df)
+    ann_pred_test = _predict_ann(
+        ann_model, ann_x_scaler, ann_y_scaler, np.asarray(X_test_df.to_numpy(), dtype=float)
+    )
+    test_metrics = {
+        "random_forest": evaluate(y_test, rf_pred_test),
+        "ann": evaluate(y_test, ann_pred_test),
+        "n_train": len(train_df),
+        "n_val": len(val_df),
+        "n_test": len(test_df),
+    }
+
+    full_X_df = cast(pd.DataFrame, work[feature_columns])
+    predictions = pd.DataFrame(index=work.index)
+    predictions[target_column] = work[target_column]
+    predictions["rf_pred_c"] = rf_model.predict(full_X_df)
+    predictions["ann_pred_c"] = _predict_ann(
+        ann_model, ann_x_scaler, ann_y_scaler, np.asarray(full_X_df.to_numpy(), dtype=float)
+    )
+    predictions["split"] = (
+        ["train"] * len(train_df) + ["val"] * len(val_df) + ["test"] * len(test_df)
+    )
 
     return TrainedModels(
         label=label,

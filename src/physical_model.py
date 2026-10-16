@@ -1,18 +1,22 @@
 """
-Physical baseline rail-temperature model.
+Model B: secondary steady-state rail-temperature baseline.
 
 IMPORTANT HONESTY NOTE:
 This is a standard steady-state surface energy-balance model of the kind
 widely used in pavement/rail surface temperature literature (solar
-absorption balanced against convective + longwave-radiative cooling). It
-is NOT a reproduction of the exact proprietary formula or fitted
-coefficients from Hong, Park & Cho (2021, Sensors) or Hong et al. (2019,
-IJPEM-GT) -- those papers' exact equations/coefficients were not available
-to derive this from. Treat this as a physically-reasonable stand-in
-baseline, not a validated replication of those papers' physical model.
-Coefficients (absorptivity, emissivity, convection correlation) are typical
-literature values for weathered/oxidized steel and should be recalibrated
-against real rail temperature measurements once available.
+absorption balanced against convective + longwave-radiative cooling), with
+no thermal mass/lag. It is a generic stand-in, not sourced from a specific
+paper's exact formula or fitted coefficients.
+
+This is NOT the model RF/ANN are trained against -- that is Model A, the
+real published RailTemp/CNU transient model (Hong et al. 2019, IJPEM-GT),
+run via tools/railtemp_cnu/run_cnu.py. This module exists only to produce
+a fast, full-dataset-scale cross-check against Model A (see
+outputs/physical_model_agreement.csv and README.md's "Physical models"
+section) -- it is not meant to approximate any particular paper's model
+itself. Coefficients (absorptivity, emissivity, convection correlation) are
+typical literature values for weathered/oxidized steel and should be
+recalibrated against real rail temperature measurements once available.
 
 Model
 -----
@@ -90,13 +94,20 @@ def predict_rail_temperature(
 
 
 def add_physical_baseline(df: pd.DataFrame) -> pd.DataFrame:
-    """Append a `rail_temp_physical_c` column computed by the physical model.
+    """Append a `rail_temp_steadystate_c` column computed by this module's
+    generic steady-state heat-balance model ("Model B" in README.md).
+
+    This is the fast, full-dataset-scale secondary baseline, used to
+    cross-check the real RailTemp/CNU transient model ("Model A", run
+    separately via tools/railtemp_cnu/run_cnu.py) -- see
+    outputs/physical_model_agreement.csv. It is NOT the ML training target;
+    that is rail_temp_cnu_c (see src/train_models.py PROXY_TARGET_COLUMN).
 
     Expects columns: air_temp_c, clearsky_ghi_wm2, wind_speed_ms
     (produced by src/fetch_weather.py).
     """
     out = df.copy()
-    out["rail_temp_physical_c"] = predict_rail_temperature(
+    out["rail_temp_steadystate_c"] = predict_rail_temperature(
         air_temp_c=out["air_temp_c"],
         ghi_wm2=out["clearsky_ghi_wm2"],
         wind_speed_ms=out["wind_speed_ms"],

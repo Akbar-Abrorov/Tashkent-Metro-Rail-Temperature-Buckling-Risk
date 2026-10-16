@@ -6,3 +6,4 @@ scikit-learn==1.9.0
 xgboost==3.4.1
 torch==2.14.0
 matplotlib==3.11.1
+joblib==1.6.0

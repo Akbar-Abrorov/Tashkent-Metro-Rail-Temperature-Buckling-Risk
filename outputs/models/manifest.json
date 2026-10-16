@@ -1,0 +1,16 @@
+{
+  "label": "PROXY (physical-baseline-as-target, NOT real-world validated)",
+  "feature_columns": [
+    "air_temp_c",
+    "rel_humidity_pct",
+    "wind_speed_ms",
+    "pressure_hpa",
+    "cloud_cover_okta",
+    "solar_zenith_deg",
+    "solar_elevation_deg",
+    "clearsky_ghi_wm2",
+    "clearsky_dni_wm2",
+    "clearsky_dhi_wm2"
+  ],
+  "target_column": "rail_temp_cnu_c"
+}
