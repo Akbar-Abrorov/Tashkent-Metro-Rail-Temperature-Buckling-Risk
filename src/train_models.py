@@ -109,13 +109,14 @@ class RailTempANN(nn.Module):
 
 
 def chronological_split_3way(
-    df: pd.DataFrame, val_frac: float = 0.15, test_frac: float = 0.15,
+    df: pd.DataFrame, val_frac: float = 0.2, test_frac: float = 0.2,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Time-ordered 3-way split (not random) -- appropriate for autocorrelated
-    hourly data. Train is the earliest block, val the next block (used only
-    for ANN early stopping / model selection), test the most recent block
-    (the only split ever used to report accuracy -- see README's "Evaluation
-    methodology" section).
+    hourly data. Train is the earliest block (60%), val the next block (20%,
+    used only for ANN early stopping / model selection -- a separate,
+    independent set from test, never used to report accuracy), test the
+    most recent block (20%, the only split ever used to report accuracy --
+    see README's "Evaluation methodology" section).
     """
     df = df.sort_index()
     n = len(df)
@@ -227,7 +228,7 @@ def _train_and_evaluate(
         raise ValueError(f"Missing feature columns: {missing_features}")
 
     work = df.dropna(subset=feature_columns + [target_column]).copy()
-    train_df, val_df, test_df = chronological_split_3way(work, val_frac=0.15, test_frac=0.15)
+    train_df, val_df, test_df = chronological_split_3way(work, val_frac=0.2, test_frac=0.2)
 
     X_train_df = cast(pd.DataFrame, train_df[feature_columns])
     X_val_df = cast(pd.DataFrame, val_df[feature_columns])
@@ -347,7 +348,7 @@ def evaluate_cached_models(
     recompute held-out test metrics and full-dataset predictions for a
     loaded (not retrained) model pair."""
     work = df.dropna(subset=feature_columns + [target_column]).copy()
-    train_df, val_df, test_df = chronological_split_3way(work, val_frac=0.15, test_frac=0.15)
+    train_df, val_df, test_df = chronological_split_3way(work, val_frac=0.2, test_frac=0.2)
 
     X_test_df = cast(pd.DataFrame, test_df[feature_columns])
     y_test = np.asarray(cast(pd.Series, test_df[target_column]).to_numpy(), dtype=float)

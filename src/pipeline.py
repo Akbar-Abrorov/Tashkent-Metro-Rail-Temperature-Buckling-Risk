@@ -26,6 +26,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from baselines import compute_baselines
+from diagnostics import run_all_diagnostics
 from physical_model import add_physical_baseline
 from plots import plot_model_comparison, plot_physical_model_agreement, plot_weather_overview
 from train_models import (
@@ -158,13 +160,29 @@ def main() -> None:
     trained.predictions.to_csv(results_path)
     print(f"\nSaved predictions to: {results_path}")
 
+    print("\nNaive baselines (same held-out test split, for comparison):")
+    baseline_metrics = compute_baselines(df, FEATURE_COLUMNS, PROXY_TARGET_COLUMN)
+    for name, m in baseline_metrics.items():
+        print(f"  {name:15s} RMSE={m['rmse']:.3f} C  MAE={m['mae']:.3f} C  R2={m['r2']:.4f}")
+
     metrics_rows = []
     for model_name, m in trained.test_metrics.items():
         if isinstance(m, dict):
-            metrics_rows.append({"model": model_name, "label": trained.label, **m})
+            metrics_rows.append({"model": model_name, "label": trained.label, "rmse": m["rmse"],
+                                  "mae": m["mae"], "r2": m["r2"]})
+    for name, m in baseline_metrics.items():
+        metrics_rows.append({"model": name, "label": "naive baseline (same test split)",
+                              "rmse": m["rmse"], "mae": m["mae"], "r2": m["r2"]})
     metrics_path = OUTPUTS_DIR / "test_metrics.csv"
     pd.DataFrame(metrics_rows).to_csv(metrics_path, index=False)
-    print(f"Saved held-out test metrics to: {metrics_path}")
+    print(f"Saved held-out test metrics (RF/ANN + naive baselines) to: {metrics_path}")
+
+    print("\nRunning diagnostics (feature importance, parity/residual plots, "
+          "error-by-temperature-regime)...")
+    run_all_diagnostics(
+        trained.predictions, PROXY_TARGET_COLUMN, trained.rf_model, FEATURE_COLUMNS,
+        OUTPUTS_DIR, PLOTS_DIR,
+    )
 
     print("\nGenerating plots...")
     plot_weather_overview(df, PLOTS_DIR / "tashkent_weather_overview.png")

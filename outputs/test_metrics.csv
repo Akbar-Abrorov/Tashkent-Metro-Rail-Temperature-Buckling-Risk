@@ -1,3 +1,5 @@
 model,label,rmse,mae,r2
-random_forest,"PROXY (physical-baseline-as-target, NOT real-world validated)",1.0923647897059687,0.7461379510372599,0.9901795448724984
-ann,"PROXY (physical-baseline-as-target, NOT real-world validated)",1.2175165169339366,0.9375075760134668,0.9878003898476543
+random_forest,"PROXY (physical-baseline-as-target, NOT real-world validated)",0.9744287130781637,0.6702780394671383,0.9932330078310543
+ann,"PROXY (physical-baseline-as-target, NOT real-world validated)",1.107465758033327,0.8215304118721475,0.99125910018133
+persistence,naive baseline (same test split),2.3489557210192142,1.7814497276547905,0.9606771316792225
+linear_airtemp,naive baseline (same test split),3.734417396849588,3.1089465432445045,0.9006103311334348

@@ -19,6 +19,22 @@ to run over the full range (in practice this takes only ~30s per ~22k rows
 on this machine -- the per-row Python loop turned out not to be a scaling
 problem for an hourly dataset of this size).
 
+WHERE THIS MODEL IS EVEN PHYSICALLY APPLICABLE (a scope correction, not a
+footnote -- see README.md "Physical models" and "Known limitations"):
+Solar rail-surface heating, the entire premise of this model, is only a real
+phenomenon on EXPOSED (at-grade or elevated) track. Per Wikipedia, Tashkent
+Metro's three original lines (Chilonzor/red, O'zbekiston/blue,
+Yunusobod/green) run entirely in underground tunnels (8-25 m deep) -- rail
+temperature there is governed by the tunnel thermal environment, not solar
+heat balance, and this model does not apply to them at all. The one
+Tashkent Metro line this model's physics is actually relevant to is the
+Circle Line (gold), under construction since 2020, designed as a ~52 km
+ring with ~50.5 km on elevated overpasses. This project was never told
+which specific line/segment its weather station's readings should be
+paired with, so it should be read as "what would an exposed Tashkent-area
+rail segment's temperature look like," not as a statement about any
+specific currently-operating underground line.
+
 MODELING CHOICES (all documented, none hidden):
 - Rail profile: UIC60 (bundled with the package). The exact profile used on
   Tashkent Metro track is not known to this project; UIC60 is the closest
@@ -27,11 +43,18 @@ MODELING CHOICES (all documented, none hidden):
   surface area per 1 m of rail) are computed directly from the UIC60 profile
   coordinates shipped with the package (shoelace polygon area / polygon
   perimeter), not guessed constants.
-- Track azimuth (90 deg, i.e. east-west) and ambient_emissivity (0.5, the
-  value used in the package's own worked example) are both assumptions --
-  the real track orientation and sky-view factor for this corridor are
-  unknown. `RailMaterial` absorptivity (0.8) and emissivity (0.7) match the
-  literature defaults already used in src/physical_model.py, for
+- Track azimuth (90 deg) and ambient_emissivity (0.5, the value used in the
+  package's own worked example) are assumptions, deliberately NOT derived
+  from a specific real segment: the one line this model is physically
+  relevant to (the Circle Line, above) is a ring, so by design its azimuth
+  varies continuously over the full 0-360 deg range as it curves around the
+  city -- no single "real" azimuth exists for "the Tashkent Metro track" to
+  look up. 90 deg is used as an arbitrary representative midpoint; see
+  tools/railtemp_cnu/sensitivity.py / outputs/plots/model_a_sensitivity.png
+  for how much this specific choice matters (answer: a lot -- mean
+  deviation up to ~1.2 C, max ~6 C across the 0-180 deg range in the 3-month
+  test window). `RailMaterial` absorptivity (0.8) and emissivity (0.7)
+  match the literature defaults already used in src/physical_model.py, for
   comparability between the two physical models.
 - Solar input is `clearsky_dni_wm2` (direct normal irradiance), NOT
   `clearsky_ghi_wm2`. The CNU model's sun-exposed area (`As`) is already the
@@ -91,41 +114,43 @@ def rail_geometry_from_profile(name: str) -> tuple[float, float, float]:
     return area, perimeter, perimeter
 
 
-def main() -> None:
-    raw_weather_csv = Path(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_RAW_WEATHER_CSV
-    if not raw_weather_csv.exists():
-        sys.exit(f"Missing weather CSV: {raw_weather_csv}. Run src/fetch_weather.py first.")
-
-    out_csv = (
-        PROJECT_ROOT / "data" / "processed" / f"railtemp_cnu_baseline_{raw_weather_csv.stem.removeprefix('tashkent_weather_')}.csv"
-    )
-
-    print(f"Loading weather data from: {raw_weather_csv}")
+def load_weather(raw_weather_csv: Path) -> pd.DataFrame:
     df = pd.read_csv(raw_weather_csv, index_col=0, parse_dates=True)
     # The CSV index is already tz-aware local time (+05:00); railtemp's own
     # __fetch_solar_data() calls tz_localize(tz) itself and errors on an
     # already-tz-aware index, so hand it naive local timestamps instead.
     df.index = df.index.tz_localize(None)
-    print(f"Loaded {len(df)} hourly rows, {df.index.min()} to {df.index.max()}")
+    return df
 
-    cross_area, convection_area, radiation_area = rail_geometry_from_profile(RAIL_PROFILE_NAME)
-    print(
-        f"{RAIL_PROFILE_NAME} geometry (from bundled profile coordinates): "
-        f"cross_area={cross_area:.6f} m^2, convection_area=radiation_area="
-        f"{convection_area:.6f} m^2 per 1 m rail length"
-    )
 
-    material = RailMaterial(density=7850.0, solar_absort=SOLAR_ABSORPTIVITY, emissivity=RAIL_EMISSIVITY)
+def simulate(
+    df: pd.DataFrame,
+    *,
+    profile_name: str = RAIL_PROFILE_NAME,
+    azimuth_deg: float = TRACK_AZIMUTH_DEG,
+    ambient_emissivity: float = AMBIENT_EMISSIVITY,
+    solar_absorptivity: float = SOLAR_ABSORPTIVITY,
+    rail_emissivity: float = RAIL_EMISSIVITY,
+    quiet: bool = False,
+) -> pd.Series:
+    """Run the CNU transient simulation for one parameter combination.
+    Returns a Series of rail_temp_cnu_c indexed by (naive local) timestamp.
+    Exposed as a function (not just the CLI `main()` below) so
+    sensitivity.py can call it repeatedly with different parameters without
+    re-deriving rail geometry or re-parsing weather each time."""
+    cross_area, convection_area, radiation_area = rail_geometry_from_profile(profile_name)
+
+    material = RailMaterial(density=7850.0, solar_absort=solar_absorptivity, emissivity=rail_emissivity)
     rail = Rail(
-        name=RAIL_PROFILE_NAME,
-        azimuth=TRACK_AZIMUTH_DEG,
+        name=profile_name,
+        azimuth=azimuth_deg,
         lat=STATION_LAT,
         long=STATION_LON,
         elev=STATION_ELEVATION_M,
         cross_area=cross_area,
         convection_area=convection_area,
         radiation_area=radiation_area,
-        ambient_emissivity=AMBIENT_EMISSIVITY,
+        ambient_emissivity=ambient_emissivity,
         material=material,
     )
 
@@ -137,18 +162,45 @@ def main() -> None:
     )
 
     initial_temp_c = float(df["air_temp_c"].iloc[0])
-    print(f"Running CNU transient simulation (Trail_initial={initial_temp_c:.2f} C)...")
+    if not quiet:
+        print(f"Running CNU (azimuth={azimuth_deg}, ambient_emissivity={ambient_emissivity}, "
+              f"Trail_initial={initial_temp_c:.2f} C)...")
     start = time.time()
     sim = CNU(rail=rail, weather=weather)
     sim.run(Trail_initial=initial_temp_c)
-    print(f"Simulation finished in {time.time() - start:.1f}s")
+    if not quiet:
+        print(f"  finished in {time.time() - start:.1f}s")
 
-    result = sim.result[["Tr_simu"]].rename(columns={"Tr_simu": "rail_temp_cnu_c"})
+    result = sim.result["Tr_simu"].rename("rail_temp_cnu_c")
     result.index.name = "time"
-    print(result["rail_temp_cnu_c"].describe().round(2).to_string())
+    return result
+
+
+def main() -> None:
+    raw_weather_csv = Path(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_RAW_WEATHER_CSV
+    if not raw_weather_csv.exists():
+        sys.exit(f"Missing weather CSV: {raw_weather_csv}. Run src/fetch_weather.py first.")
+
+    out_csv = (
+        PROJECT_ROOT / "data" / "processed" / f"railtemp_cnu_baseline_{raw_weather_csv.stem.removeprefix('tashkent_weather_')}.csv"
+    )
+
+    print(f"Loading weather data from: {raw_weather_csv}")
+    df = load_weather(raw_weather_csv)
+    print(f"Loaded {len(df)} hourly rows, {df.index.min()} to {df.index.max()}")
+
+    cross_area, convection_area, _radiation_area = rail_geometry_from_profile(RAIL_PROFILE_NAME)
+    print(
+        f"{RAIL_PROFILE_NAME} geometry (from bundled profile coordinates): "
+        f"cross_area={cross_area:.6f} m^2, convection_area=radiation_area="
+        f"{convection_area:.6f} m^2 per 1 m rail length"
+    )
+
+    result = simulate(df)
+    print(result.describe().round(2).to_string())
 
     out_csv.parent.mkdir(parents=True, exist_ok=True)
-    result.to_csv(out_csv)
+    result.to_frame().to_csv(out_csv)
     print(f"Saved RailTemp/CNU baseline to: {out_csv}")
 
 
